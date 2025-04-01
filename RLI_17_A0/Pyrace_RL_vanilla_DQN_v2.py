@@ -201,5 +201,5 @@ if __name__ == "__main__":
     # Option 1: Train the DQN agent from scratch.
     # simulate(learning=True, episode_start=0)
     
-    # Option 2: Load a saved model (e.g. from episode 3500) and play (or continue training).
+    # Option 2: Load a saved model and play (or continue training).
     load_and_play(4000, learning=False)
