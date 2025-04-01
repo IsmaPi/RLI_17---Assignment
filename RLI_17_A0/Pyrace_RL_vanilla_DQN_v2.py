@@ -13,10 +13,10 @@ import torch.optim as optim
 from collections import deque
 
 VERSION_NAME     = 'DQN_v02'         # Model/version name for saving models and plots
-REPORT_EPISODES  = 200               # Report (plot/save model) every REPORT_EPISODES episodes
-DISPLAY_EPISODES = 500               # Render/display the game every DISPLAY_EPISODES episodes
+REPORT_EPISODES  = 500               # Report (plot/save model) every REPORT_EPISODES episodes
+DISPLAY_EPISODES = 100               # Render/display the game every DISPLAY_EPISODES episodes
 
-EPISODES         = 3000             # Total number of episodes to train
+EPISODES         = 10000             # Total number of episodes to train
 MAX_T            = 1000              # Maximum timesteps per episode
 
 # DQN Hyperparameters
@@ -24,7 +24,7 @@ LEARNING_RATE    = 0.001
 GAMMA            = 0.99
 EPSILON_START    = 1.0
 EPSILON_MIN      = 0.01
-EPSILON_DECAY    = 0.995
+EPSILON_DECAY    = 0.9
 BATCH_SIZE       = 64
 TARGET_UPDATE_FREQ = 1000
 MEMORY_SIZE      = 10000
@@ -199,7 +199,7 @@ if __name__ == "__main__":
     # Uncomment one of the following options:
     
     # Option 1: Train the DQN agent from scratch.
-    simulate(learning=True, episode_start=0)
+    # simulate(learning=True, episode_start=0)
     
     # Option 2: Load a saved model (e.g. from episode 3500) and play (or continue training).
-    # load_and_play(3500, learning=False)
+    load_and_play(4000, learning=False)
