@@ -1,0 +1,301 @@
+import gymnasium as gym
+import numpy as np
+import random
+from collections import deque
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import gym_race
+import traceback
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        # Increased network capacity
+        self.fc1 = nn.Linear(state_size, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, action_size)
+        
+        # Initialize weights with smaller values
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+            module.bias.data.fill_(0.01)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
+        return self.fc4(x)
+
+class Agent:
+    def __init__(self, state_size, action_size, action_low, action_high):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.action_low = action_low
+        self.action_high = action_high
+        self.memory = deque(maxlen=50000)
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995  # Slower epsilon decay
+        self.batch_size = 128  # Increased batch size
+
+        self.model = DQN(state_size, action_size).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)  # Lower learning rate
+        self.criterion = nn.MSELoss()
+        
+        # Track previous position and checkpoint for reward calculation
+        self.prev_position = None
+        self.prev_checkpoint = 0
+        self.max_checkpoint = 0
+        self.expected_checkpoint = 1  # Start with checkpoint 1
+        self.checkpoint_rewards = {i: 0 for i in range(1, 11)}  # Track rewards for each checkpoint
+        
+        # Track movement history to detect stuck behavior
+        self.movement_history = deque(maxlen=50)
+        self.stuck_threshold = 0.1  # Distance threshold for considering the car stuck
+        self.stuck_penalty = -5.0  # Penalty for being stuck
+        self.rotation_penalty = -2.0  # Penalty for excessive rotation
+        
+        # Track previous angle for rotation detection
+        self.prev_angle = None
+        self.rotation_count = 0
+        self.max_rotation_count = 10  # Maximum allowed rotations before penalty
+
+    def remember(self, state, action, reward, next_state, done):
+        # Convert state to float32
+        state = np.array(state, dtype=np.float32)
+        next_state = np.array(next_state, dtype=np.float32)
+        self.memory.append((state, action, reward, next_state, done))
+
+    def calculate_reward(self, state, reward, done):
+        # Extract position and checkpoint from state
+        current_position = state[:2]
+        current_checkpoint = int(state[2])
+        
+        # Initialize prev_position if None
+        if self.prev_position is None:
+            self.prev_position = current_position
+            self.prev_angle = state[3]  # Assuming angle is the 4th element
+            return reward
+        
+        # Calculate distance moved
+        distance_moved = np.linalg.norm(current_position - self.prev_position)
+        
+        # Update movement history
+        self.movement_history.append(distance_moved)
+        
+        # Calculate average movement over history
+        avg_movement = np.mean(self.movement_history) if self.movement_history else 0
+        
+        # Check for stuck behavior
+        is_stuck = avg_movement < self.stuck_threshold
+        
+        # Calculate angle change
+        current_angle = state[3]  # Assuming angle is the 4th element
+        angle_change = abs(current_angle - self.prev_angle)
+        
+        # Update rotation tracking
+        if angle_change > 0.5:  # Significant rotation
+            self.rotation_count += 1
+        else:
+            self.rotation_count = max(0, self.rotation_count - 1)
+        
+        # Update previous values
+        self.prev_position = current_position
+        self.prev_angle = current_angle
+        
+        # Base movement reward - strongly incentivize forward movement
+        movement_reward = distance_moved * 50.0  # Increased movement reward
+        
+        # Checkpoint reward logic
+        checkpoint_reward = 0
+        if current_checkpoint > self.max_checkpoint:
+            # Check if we're progressing sequentially
+            if current_checkpoint == self.expected_checkpoint:
+                # Correct sequential progression
+                checkpoint_reward = 2000.0  # Much larger reward for correct progression
+                self.expected_checkpoint += 1
+                self.checkpoint_rewards[current_checkpoint] = checkpoint_reward
+            else:
+                # Skipped checkpoints - large penalty
+                checkpoint_reward = -1000.0 * (current_checkpoint - self.expected_checkpoint)
+            
+            self.max_checkpoint = current_checkpoint
+        
+        # Direction reward - strongly encourage moving towards next checkpoint
+        direction_reward = 0
+        if hasattr(self, 'next_checkpoint_pos') and self.next_checkpoint_pos is not None:
+            # Calculate direction to next checkpoint
+            direction_to_checkpoint = self.next_checkpoint_pos - current_position
+            direction_to_checkpoint = direction_to_checkpoint / (np.linalg.norm(direction_to_checkpoint) + 1e-6)
+            
+            # Calculate movement direction
+            movement_direction = current_position - self.prev_position
+            if np.linalg.norm(movement_direction) > 1e-6:
+                movement_direction = movement_direction / np.linalg.norm(movement_direction)
+                
+                # Dot product between movement and checkpoint direction
+                direction_alignment = np.dot(movement_direction, direction_to_checkpoint)
+                direction_reward = direction_alignment * 20.0  # Increased direction reward
+        
+        # Combine all rewards
+        total_reward = reward + movement_reward + checkpoint_reward + direction_reward
+        
+        # Apply penalties
+        if is_stuck:
+            total_reward += self.stuck_penalty
+        
+        # Penalize excessive rotation
+        if self.rotation_count > self.max_rotation_count:
+            total_reward += self.rotation_penalty * (self.rotation_count - self.max_rotation_count)
+        
+        # Penalize going backwards
+        if current_checkpoint < self.max_checkpoint:
+            total_reward -= 5.0  # Increased penalty for going backwards
+        
+        # Add a small constant reward for any forward movement
+        if distance_moved > 0.01:
+            total_reward += 1.0
+        
+        return total_reward
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            # Random action within the action space bounds
+            return np.random.uniform(self.action_low, self.action_high, self.action_size)
+        
+        # Convert state to float32
+        state = np.array(state, dtype=np.float32)
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        with torch.no_grad():
+            act_values = self.model(state)
+        
+        # Convert to numpy and clip to action bounds
+        action = act_values[0].cpu().numpy()
+        return np.clip(action, self.action_low, self.action_high)
+
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+
+        minibatch = random.sample(self.memory, self.batch_size)
+        states = []
+        targets = []
+
+        for state, action, reward, next_state, done in minibatch:
+            state_tensor = torch.FloatTensor(state).to(device)
+            next_state_tensor = torch.FloatTensor(next_state).to(device)
+            
+            # Get current Q values
+            current_q_values = self.model(state_tensor)
+            
+            # Calculate target Q values
+            with torch.no_grad():
+                next_q_values = self.model(next_state_tensor)
+                max_next_q = torch.max(next_q_values)
+                target_q = reward + (1 - done) * self.gamma * max_next_q
+            
+            # Update only the Q value for the action taken
+            target = current_q_values.clone()
+            target[0] = target_q
+            
+            states.append(state_tensor)
+            targets.append(target)
+
+        states_tensor = torch.stack(states)
+        targets_tensor = torch.stack(targets)
+
+        self.optimizer.zero_grad()
+        predictions = self.model(states_tensor)
+        loss = self.criterion(predictions, targets_tensor)
+        loss.backward()
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+def simulate(episodes=1000):
+    env = gym.make('Pyrace-v1')
+    state, _ = env.reset()
+    # Convert state to float32
+    state = np.array(state, dtype=np.float32)
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.shape[0]
+    action_low = env.action_space.low
+    action_high = env.action_space.high
+    
+    agent = Agent(state_size, action_size, action_low, action_high)
+    
+    # For tracking best performance
+    best_reward = float('-inf')
+    no_improvement_count = 0
+    max_no_improvement = 50  # Reset if no improvement for 50 episodes
+
+    for e in range(episodes):
+        state, _ = env.reset()
+        # Convert state to float32
+        state = np.array(state, dtype=np.float32)
+        total_reward = 0
+        done = False
+        step = 0
+        agent.prev_position = None  # Reset position tracking
+        agent.max_checkpoint = 0    # Reset checkpoint tracking
+        agent.expected_checkpoint = 1  # Reset expected checkpoint
+        agent.checkpoint_rewards = {i: 0 for i in range(1, 11)}  # Reset checkpoint rewards
+        agent.movement_history.clear()  # Clear movement history
+        agent.rotation_count = 0  # Reset rotation count
+
+        while not done and step < 1000:  # Add step limit to prevent infinite loops
+            action = agent.act(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            # Convert next_state to float32
+            next_state = np.array(next_state, dtype=np.float32)
+            done = terminated or truncated
+            
+            # Calculate shaped reward
+            shaped_reward = agent.calculate_reward(next_state, reward, done)
+            
+            try:
+                env.render()
+            except Exception as render_error:
+                print(f"Warning: Render error at episode {e+1}, step {step}: {render_error}")
+                # Continue without rendering
+                pass
+                
+            agent.remember(state, action, shaped_reward, next_state, done)
+            state = next_state
+            total_reward += shaped_reward
+            step += 1
+
+            agent.replay()
+
+        # Track best performance
+        if total_reward > best_reward:
+            best_reward = total_reward
+            no_improvement_count = 0
+            # Save the best model
+            torch.save(agent.model.state_dict(), f'best_model_episode_{e+1}.pth')
+        else:
+            no_improvement_count += 1
+            
+        # Reset if no improvement for too long
+        if no_improvement_count >= max_no_improvement:
+            print(f"No improvement for {max_no_improvement} episodes, resetting epsilon...")
+            agent.epsilon = 1.0  # Reset exploration
+            no_improvement_count = 0
+
+        print(f"Episode {e + 1}/{episodes}, Total Reward: {total_reward:.2f}, Epsilon: {agent.epsilon:.2f}, Best: {best_reward:.2f}, Checkpoint: {agent.max_checkpoint}, Expected: {agent.expected_checkpoint}")
+
+    env.close()
+
+if __name__ == "__main__":
+    simulate(episodes=5000)
